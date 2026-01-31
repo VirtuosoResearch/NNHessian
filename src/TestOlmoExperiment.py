@@ -1,9 +1,14 @@
 import argparse
 import math
+import os
+import sys
 
 import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+sys.path.insert(0, os.path.dirname(__file__))
+from nnhessian.calculator import NNHessianCalculator
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,6 +49,24 @@ def parse_args() -> argparse.Namespace:
         "--device",
         default=None,
         help="Device override (e.g., cpu, cuda). Default: auto",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Batch size for Hessian trace evaluation",
+    )
+    parser.add_argument(
+        "--hutchinson-samples",
+        type=int,
+        default=8,
+        help="Number of Hutchinson probe vectors",
+    )
+    parser.add_argument(
+        "--max-docs",
+        type=int,
+        default=None,
+        help="Optional limit on number of documents (default: use full split)",
     )
     parser.add_argument(
         "--dtype",
@@ -102,21 +125,67 @@ def compute_perplexity(
     return math.exp(nll_sum / max(n_tokens, 1))
 
 
+def build_lm_dataloader(
+    tokenizer: AutoTokenizer,
+    texts,
+    max_seq_len: int,
+    batch_size: int,
+    device: torch.device,
+):
+    encodings = tokenizer("\n\n".join(texts), return_tensors="pt")
+    input_ids = encodings.input_ids[0]
+
+    if input_ids.numel() < max_seq_len + 1:
+        raise ValueError("Not enough tokens to form a single sequence.")
+
+    n_blocks = input_ids.numel() // max_seq_len
+    input_ids = input_ids[: n_blocks * max_seq_len]
+    input_ids = input_ids.view(n_blocks, max_seq_len)
+
+    dataset = torch.utils.data.TensorDataset(input_ids)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+    def load_batch_func(batch, device_arg):
+        data = batch[0].to(device_arg)
+        target = data.clone()
+        return data, target, data.size(0)
+
+    return dataloader, load_batch_func
+
+
+def causal_lm_loss(outputs, labels):
+    logits = outputs.logits
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = labels[:, 1:].contiguous()
+    return torch.nn.functional.cross_entropy(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
+        reduction="mean",
+    )
+
+
 def main() -> None:
     args = parse_args()
 
     device = torch.device(args.device) if args.device else torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
+    if device.type == "cuda":
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
     dtype = pick_dtype(args.dtype, device)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype)
     model.to(device)
     model.eval()
 
     dataset = load_dataset(args.dataset, args.dataset_config, split=args.split)
     texts = [t for t in dataset["text"] if t.strip()]
+    if args.max_docs is not None:
+        texts = texts[: args.max_docs]
 
     ppl = compute_perplexity(
         model=model,
@@ -127,9 +196,31 @@ def main() -> None:
         device=device,
     )
 
+    dataloader, load_batch_func = build_lm_dataloader(
+        tokenizer=tokenizer,
+        texts=texts,
+        max_seq_len=args.max_seq_len,
+        batch_size=args.batch_size,
+        device=device,
+    )
+
+    calc = NNHessianCalculator(
+        model=model,
+        loss_fn=causal_lm_loss,
+        dataloader=dataloader,
+        external_load_batch_func=load_batch_func,
+        device=device,
+    )
+
+    trace = calc.hutchinson_trace(
+        num_samples=args.hutchinson_samples,
+        distribution="rademacher",
+    )
+
     print(f"Model: {args.model}")
     print(f"Dataset: {args.dataset}/{args.dataset_config} [{args.split}]")
     print(f"Perplexity: {ppl:.4f}")
+    print(f"Hessian trace (Hutchinson, K={args.hutchinson_samples}): {trace:.4e}")
 
 
 if __name__ == "__main__":
