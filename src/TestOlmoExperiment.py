@@ -2,6 +2,7 @@ import argparse
 import math
 import os
 import sys
+import time
 
 import torch
 from datasets import load_dataset
@@ -69,10 +70,27 @@ def parse_args() -> argparse.Namespace:
         help="Optional limit on number of documents (default: use full split)",
     )
     parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=1,
+        help="Progress print interval for Hessian trace samples",
+    )
+    parser.add_argument(
         "--dtype",
         default="auto",
         choices=["auto", "float16", "bfloat16", "float32"],
         help="Model dtype (default: auto)",
+    )
+    parser.add_argument(
+        "--max-hessian-batches",
+        type=int,
+        default=None,
+        help="Maximum number of batches to use for Hessian calculation (default: use all)",
+    )
+    parser.add_argument(
+        "--gradient-checkpointing",
+        action="store_true",
+        help="Enable gradient checkpointing to reduce memory usage",
     )
     return parser.parse_args()
 
@@ -103,7 +121,7 @@ def compute_perplexity(
     nll_sum = 0.0
     n_tokens = 0
 
-    for start in range(0, input_ids.size(1), stride):
+    for i, start in enumerate(range(0, input_ids.size(1), stride), start=1):
         end = min(start + max_seq_len, input_ids.size(1))
         input_ids_window = input_ids[:, start:end]
         target_ids = input_ids_window.clone()
@@ -118,6 +136,9 @@ def compute_perplexity(
         n_tokens_window = input_ids_window.size(1) - 1
         nll_sum += neg_log_likelihood.item() * n_tokens_window
         n_tokens += n_tokens_window
+
+        if i % 10 == 0:
+            print(f"[ppl] processed {end} / {input_ids.size(1)} tokens")
 
         if end == input_ids.size(1):
             break
@@ -164,6 +185,62 @@ def causal_lm_loss(outputs, labels):
     )
 
 
+def hutchinson_trace_with_progress(
+    calc: NNHessianCalculator,
+    num_samples: int,
+    distribution: str,
+    progress_every: int,
+    seed: int | None = None,
+):
+    if calc.dataloader is None:
+        raise ValueError("No dataloader provided.")
+
+    if hasattr(calc, "named_params") and len(calc.named_params) > 0:
+        params = list(calc.named_params.values())
+    else:
+        params = [p for p in calc.model.parameters() if p.requires_grad]
+
+    if len(params) == 0:
+        raise ValueError("No trainable/selected parameters found.")
+
+    device = calc.device
+    p_dtype = params[0].dtype
+    n_params = sum(p.numel() for p in params)
+
+    g = torch.Generator(device=device)
+    if seed is not None:
+        g.manual_seed(seed)
+
+    estimates = []
+    start_t = time.perf_counter()
+    for i in range(1, num_samples + 1):
+        if distribution.lower() in ("rademacher", "rad"):
+            z = torch.randint(0, 2, (n_params,), generator=g, device=device).to(dtype=p_dtype)
+            z = z * 2 - 1
+        elif distribution.lower() in ("normal", "gaussian"):
+            z = torch.randn(n_params, generator=g, device=device, dtype=p_dtype)
+        else:
+            raise ValueError("distribution must be 'rademacher' or 'normal'.")
+
+        Hz = calc._hessian_vector_product(z, dataloader=calc.dataloader)
+
+        # Check for NaN/Inf in Hessian-vector product
+        if torch.isnan(Hz).any() or torch.isinf(Hz).any():
+            print(f"[WARNING] NaN/Inf detected in Hessian-vector product at sample {i}")
+            print(f"  NaN count: {torch.isnan(Hz).sum().item()}")
+            print(f"  Inf count: {torch.isinf(Hz).sum().item()}")
+            continue
+
+        est = float((z.detach().cpu() * Hz).sum().item())
+        estimates.append(est)
+
+        if progress_every > 0 and i % progress_every == 0:
+            elapsed = time.perf_counter() - start_t
+            print(f"[hutch] {i}/{num_samples} samples, elapsed {elapsed:.1f}s")
+
+    return sum(estimates) / len(estimates)
+
+
 def main() -> None:
     args = parse_args()
 
@@ -180,6 +257,15 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype)
     model.to(device)
+
+    # Enable gradient checkpointing if requested
+    if args.gradient_checkpointing:
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+            print("[model] Gradient checkpointing enabled")
+        else:
+            print("[WARNING] Model does not support gradient checkpointing")
+
     model.eval()
 
     dataset = load_dataset(args.dataset, args.dataset_config, split=args.split)
@@ -187,6 +273,7 @@ def main() -> None:
     if args.max_docs is not None:
         texts = texts[: args.max_docs]
 
+    t0 = time.perf_counter()
     ppl = compute_perplexity(
         model=model,
         tokenizer=tokenizer,
@@ -195,6 +282,7 @@ def main() -> None:
         stride=args.stride,
         device=device,
     )
+    print(f"[ppl] done in {time.perf_counter() - t0:.1f}s")
 
     dataloader, load_batch_func = build_lm_dataloader(
         tokenizer=tokenizer,
@@ -204,18 +292,35 @@ def main() -> None:
         device=device,
     )
 
+    # Optionally limit dataloader for Hessian computation
+    if args.max_hessian_batches is not None:
+        limited_dataset = torch.utils.data.Subset(
+            dataloader.dataset,
+            range(min(args.max_hessian_batches * args.batch_size, len(dataloader.dataset)))
+        )
+        hessian_dataloader = torch.utils.data.DataLoader(
+            limited_dataset, batch_size=args.batch_size, shuffle=False
+        )
+        print(f"[hessian] Using {len(hessian_dataloader)} batches (limited from {len(dataloader)})")
+    else:
+        hessian_dataloader = dataloader
+
     calc = NNHessianCalculator(
         model=model,
         loss_fn=causal_lm_loss,
-        dataloader=dataloader,
+        dataloader=hessian_dataloader,
         external_load_batch_func=load_batch_func,
         device=device,
     )
 
-    trace = calc.hutchinson_trace(
+    t1 = time.perf_counter()
+    trace = hutchinson_trace_with_progress(
+        calc=calc,
         num_samples=args.hutchinson_samples,
         distribution="rademacher",
+        progress_every=args.progress_every,
     )
+    print(f"[hutch] done in {time.perf_counter() - t1:.1f}s")
 
     print(f"Model: {args.model}")
     print(f"Dataset: {args.dataset}/{args.dataset_config} [{args.split}]")

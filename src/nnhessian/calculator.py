@@ -163,15 +163,23 @@ class NNHessianCalculator():
         total_examples = 0
         hvp_sum_flat = torch.zeros(total_param_elems, device=device, dtype=p_dtype)
 
+        # Clear cache before starting
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
         for batch in dataloader:
             # Required contract from you:
             data, target, batch_size = self.load_batch_func(batch, device)
             output = self.model(data)
             loss = self.loss_fn(output, target)
 
-            # Ensure scalar loss; keep it simple: mean if it’s per-example
+            # Ensure scalar loss; keep it simple: mean if it's per-example
             if hasattr(loss, "dim") and loss.dim() > 0:
                 loss = loss.mean()
+
+            # Check for invalid loss
+            if torch.isnan(loss) or torch.isinf(loss):
+                raise RuntimeError(f"Invalid loss detected: {loss.item()}")
 
             # First backward (create graph for second derivative)
             self.model.zero_grad(set_to_none=True)
@@ -183,6 +191,13 @@ class NNHessianCalculator():
                 if p.grad is None:
                     g_chunks.append(torch.zeros(p.numel(), device=device, dtype=p_dtype))
                 else:
+                    # Check for invalid gradients
+                    if torch.isnan(p.grad).any() or torch.isinf(p.grad).any():
+                        raise RuntimeError(
+                            f"Invalid gradient detected after first backward: "
+                            f"NaN={torch.isnan(p.grad).sum().item()}, "
+                            f"Inf={torch.isinf(p.grad).sum().item()}"
+                        )
                     g_chunks.append(p.grad.reshape(-1))
             g_flat = torch.cat(g_chunks, dim=0)
 
@@ -204,6 +219,11 @@ class NNHessianCalculator():
 
             # Clear for next batch
             self.model.zero_grad(set_to_none=True)
+
+            # Free memory
+            del output, loss, g_flat, hv_flat
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
         if total_examples == 0:
             raise RuntimeError("Empty dataloader: total_examples is 0.")
